@@ -81,6 +81,12 @@ ros2 topic list
 ros2 topic echo /mavros/state
 ```
 
+> **Tip:** If `ros2 topic list` shows nothing (or is missing topics you expect), the ROS2 daemon may be stale. Restart it and try again:
+> ```bash
+> ros2 daemon stop
+> ros2 daemon start
+> ```
+
 ### Step 4 — Run Your Solution
 Open a second Ubuntu terminal:
 ```bash
@@ -189,6 +195,10 @@ Focus on the gate navigation first. Obstacle avoidance is optional.
 # Check available topics and services
 ros2 topic list
 ros2 service list
+
+# Restart the ROS2 daemon if topics/services are missing or stale
+ros2 daemon stop
+ros2 daemon start
 
 # Inspect message types
 ros2 interface show vision_msgs/msg/BoundingBox

@@ -1,12 +1,16 @@
 # Setup Guide
 
-This guide gets you from a fresh Windows machine to a running simulation environment. Follow the steps in order.
+This guide gets you from a fresh machine to a running simulation environment. Follow the steps in order.
+
+> **Already running Ubuntu 24.04 natively on Linux?** Skip Step 1 and start at [Step 2](#step-2--install-git-and-clone-the-repository). Step 1 is only for Windows users.
 
 ---
 
-## Step 1 — Install Ubuntu 24.04 (via WSL2)
+## Step 1 — Install Ubuntu 24.04 (via WSL2) — *Windows only*
 
-We develop inside Ubuntu on Windows using WSL2. You can install it from the **Microsoft Store** or via the command line.
+**Skip this step entirely if you already have Ubuntu 24.04 installed natively on your machine.**
+
+On Windows, we develop inside Ubuntu using WSL2. You can install it from the **Microsoft Store** or via the command line.
 
 **Option A — Microsoft Store** *(easier)*:
 Search for **Ubuntu 24.04.x LTS** in the Microsoft Store and click Install.
@@ -41,7 +45,6 @@ Inside your Ubuntu terminal:
    cd probation_ws
    git checkout probation/task
    ```
-   > **Note:** Always clone inside your Linux home directory (`~`), NOT inside `/mnt/c/` (the Windows filesystem), to ensure good performance.
 
 ---
 
@@ -55,7 +58,7 @@ Install Docker using `apt` inside Ubuntu — **do not use Docker Desktop**.
    ```bash
    sudo usermod -aG docker $USER
    ```
-4. Close and reopen your Ubuntu terminal (or run `wsl --shutdown` in Windows PowerShell and reopen Ubuntu). Then `cd ~/probation_ws`.
+4. Log out and back in so the group change takes effect — on WSL2, run `wsl --shutdown` in Windows PowerShell and reopen Ubuntu instead. Then `cd ~/probation_ws`.
 
 ---
 
