@@ -10,6 +10,17 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && pip install --break-system-packages --no-cache-dir colcon-clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Install the dependencies declared by the workspace packages (rclpy,
+# example_interfaces, vision_msgs deps, ...) via rosdep
+COPY src /tmp/rosdep_ws/src
+RUN apt-get update \
+    && rosdep update --rosdistro jazzy \
+    && DEBIAN_FRONTEND=noninteractive rosdep install -y \
+        --from-paths /tmp/rosdep_ws/src \
+        --ignore-src \
+        --rosdistro jazzy \
+    && rm -rf /tmp/rosdep_ws /var/lib/apt/lists/*
+
 # Setup non-root user matching host UID/GID (1000)
 ARG USERNAME=mecatron
 ARG USER_UID=1000

@@ -51,10 +51,11 @@ probation_ws/
 
 ## 4. Running the Simulation
 
-Enter the container first (every time you open a new Ubuntu terminal):
+Start the container (once) and enter it (every time you open a new Ubuntu terminal):
 ```bash
 cd ~/probation_ws
-docker compose run --rm dev-core bash
+docker compose up -d dev-core
+docker compose exec dev-core bash
 ```
 
 ### Step 1 — Launch the ROS2 Bridge
@@ -84,7 +85,7 @@ ros2 topic echo /mavros/state
 Open a second Ubuntu terminal:
 ```bash
 cd ~/probation_ws
-docker compose run --rm dev-core bash
+docker compose exec dev-core bash
 ```
 Then run:
 ```bash

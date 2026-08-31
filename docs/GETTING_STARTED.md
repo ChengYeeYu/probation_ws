@@ -68,9 +68,10 @@ Inside the `probation_ws` directory:
    docker compose build dev-core
    ```
 
-2. Start the container:
+2. Start the container and enter it:
    ```bash
-   docker compose run --rm dev-core bash
+   docker compose up -d dev-core
+   docker compose exec dev-core bash
    ```
 
 3. Inside the container, build the ROS2 workspace:

@@ -10,6 +10,7 @@ x-common-config: &common-config
     - .:/home/mecatron/probation_ws
     - /dev/shm:/dev/shm
   entrypoint: [scripts/entrypoint.sh]
+  command: [bash]
 
 x-core-config: &core-config
   <<: *common-config
