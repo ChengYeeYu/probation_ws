@@ -99,6 +99,7 @@ class GateNavigator(Node):
         self.probe_stamp = self.get_clock().now()
         self.probe_error = float('inf')
         self.probe_samples = []
+        self.probe_cooldown = 0
 
         # DESCEND bookkeeping: the depth we last saw real progress at, and when.
         self.depth_settle_alt = None
@@ -106,6 +107,10 @@ class GateNavigator(Node):
 
         # How many ticks in a row the gate has been both squared and centred.
         self.centred_ticks = 0
+
+        # How many ticks in a row the path has been clear of obstacles. Starts high
+        # so an unobstructed approach begins at full speed rather than easing in.
+        self.clear_ticks = 1000
         
         
         # ---------------- Parameters Setup ----------------
@@ -148,8 +153,11 @@ class GateNavigator(Node):
 
             # --- obstacle avoidance ---
             ('flare_avoid_width', 0.05),     # flare box wider than this counts as close
-            ('flare_avoid_x', 0.2),         # and within this |x_offset| counts as in the way
-            ('strafe_speed', 0.5),
+            ('flare_clearance', 0.1),       # near edge closer than this to our heading
+                                            #    counts as in the way
+            ('strafe_speed', 0.7),          # boosted: clear the obstacle faster than we close on it
+            ('avoid_slow_factor', 0.3),     # forward speed is scaled by this while dodging
+            ('clear_hold_ticks', 5),        # ticks the path must stay clear before full speed
 
             # --- timeouts ---
             ('descend_timeout', 60.0),   # backstop only; descent_has_settled is the normal exit
@@ -401,42 +409,75 @@ class GateNavigator(Node):
         if error != float('inf'):
             self.probe_samples.append(error)
 
-        # Keep collecting until the probe window is over
-        now = self.get_clock().now()
-        if (now - self.probe_stamp).nanoseconds * 1e-9 < self.param('probe_duration'):
-            return
-        if not self.probe_samples:
-            self.probe_stamp = now      # nothing usable seen, start a fresh window
+        # Keep only the most recent probe_duration seconds of readings
+        window = int(self.param('probe_duration') * self.param('control_rate'))
+        if window < 2:
+            window = 2
+        if len(self.probe_samples) > window:
+            self.probe_samples = self.probe_samples[-window:]
+
+        # After a flip, give the new direction time to show an effect before
+        # judging it, otherwise we would flip again on the very next tick.
+        if self.probe_cooldown > 0:
+            self.probe_cooldown = self.probe_cooldown - 1
             return
 
-        # Judge the window on its average, then compare it with the previous one
-        error = sum(self.probe_samples) / len(self.probe_samples)
-        self.probe_samples = []
+        # The two halves only mean something once the window is full
+        if len(self.probe_samples) < window:
+            return
 
-        if error > self.probe_error - self.param('probe_min_improvement'):
+        # Compare the newer half of the window against the older half. Averaging
+        # halves still rides out the box jitter, but because the window slides we
+        # re-judge on every tick instead of only at a fixed probe boundary, so a
+        # direction that stops helping gets caught as soon as the trend turns.
+        half = window // 2
+        older = sum(self.probe_samples[:half]) / half
+        newer = sum(self.probe_samples[half:]) / (window - half)
+        self.probe_error = newer
+
+        improvement = older - newer
+        if improvement < self.param('probe_min_improvement'):
             self.align_dir = -self.align_dir
+            self.probe_cooldown = half      # let the new direction take effect
+            self.probe_samples = []
             if self.align_dir > 0:
                 side = 'left'
             else:
                 side = 'right'
             self.get_logger().info(
-                'Align: no improvement (%.3f -> %.3f), strafing %s instead'
-                % (self.probe_error, error, side))
-
-        self.probe_stamp = now
-        self.probe_error = error
+                'Align: no improvement (%.3f -> %.3f, gain %+.3f), strafing %s instead'
+                % (older, newer, improvement, side))
+        else:
+            self.get_logger().info(
+                'Align: improving (%.3f -> %.3f, gain %+.3f), holding course'
+                % (older, newer, improvement),
+                throttle_duration_sec=1.0)
     
     # Strafe sideways to get around the red flare when it is close and roughly ahead of us.
     # Returns True if an avoidance manoeuvre was applied.
     # Note this only touches linear.y, so yaw is still free to keep the gate centred.
     def avoid_flare(self, vel_cmd):
+        # Record that avoidance was consulted on this tick, so the watch can tell
+        # "we looked and saw nothing" apart from "this state never even asked".
+        self.avoid_ran = True
+        self.avoid_active = False
+
         flare = self.get_detected_object('red_flare')
         if flare is None:
             return False
+
+        # Only worth avoiding once it is actually near. In the logged runs the box
+        # width cleanly separated the two cases: 0.01-0.02 when it was far and no
+        # threat, 0.05-0.11 on the approach that ended in a collision.
         if flare.w < self.param('flare_avoid_width'):
             return False            # still far away
-        if abs(flare.x_offset) > self.param('flare_avoid_x'):
-            return False            # off to the side, not in the way
+        # What matters is how close the obstacle's near edge comes to our heading,
+        # not where its centre is. A narrow flare only needs nudging a little off
+        # centre to be clear; a wide one needs more room. Using the edge gap gets
+        # both from one threshold instead of a fixed offset that suits neither.
+        edge_gap = abs(flare.x_offset) - flare.w / 2.0
+        if edge_gap > self.param('flare_clearance'):
+            return False            # far enough to the side, not in the way
 
         # Flare on the right (x_offset > 0) => strafe left => positive linear.y
         if flare.x_offset > 0:
@@ -452,8 +493,55 @@ class GateNavigator(Node):
         self.get_logger().info(
             'Avoiding flare: x_offset=%.2f w=%.2f -> strafe %s'
             % (flare.x_offset, flare.w, side))
+        self.avoid_active = True
         return True
 
+    # ------------------------------------ Avoidance Watch ------------------------------------ #
+    # One line per tick saying exactly what the avoidance can see and what it decided,
+    # so "it drove into the obstacle" can be told apart from "it never saw one" and
+    # from "this state does not run avoidance at all".
+    def avoidance_watch(self, vel_cmd, tick_state):
+        # The raw stored detection, before the freshness and confidence filters, so
+        # a flare that is being seen but rejected still shows up here.
+        raw = self.detected_objects.get('red_flare')
+
+        if raw is None:
+            seen = 'flare: NEVER DETECTED'
+        else:
+            age = (self.get_clock().now() - raw.stamp).nanoseconds * 1e-9
+            if age <= self.param('detection_timeout'):
+                fresh = 'fresh'
+            else:
+                fresh = 'STALE'
+            if raw.conf >= self.param('min_confidence'):
+                conf_ok = 'ok'
+            else:
+                conf_ok = 'LOW'
+            if raw.w >= self.param('flare_avoid_width'):
+                close = 'YES'
+            else:
+                close = 'no'
+            edge_gap = abs(raw.x_offset) - raw.w / 2.0
+            if edge_gap <= self.param('flare_clearance'):
+                in_path = 'YES'
+            else:
+                in_path = 'no'
+            seen = ('flare: w=%.2f h=%.2f x_off=%+.2f gap=%+.2f conf=%.2f(%s) age=%.1fs(%s) close=%s in_path=%s'
+                    % (raw.w, raw.h, raw.x_offset, edge_gap, raw.conf, conf_ok,
+                       age, fresh, close, in_path))
+
+        if not self.avoid_ran:
+            decision = 'NOT CHECKED in this state'
+        elif self.avoid_active:
+            decision = 'DODGING'
+        else:
+            decision = 'clear'
+
+        self.get_logger().info(
+            'WATCH [%s] %s | avoidance=%s clear_ticks=%d | vx=%.2f vy=%+.2f wz=%+.2f'
+            % (tick_state, seen, decision, self.clear_ticks,
+               vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.angular.z),
+            throttle_duration_sec=0.5)
 
     # ------------------------------------ State Machine ------------------------------------ #
     # Move to a new state and reset whatever that state needs on entry.
@@ -470,12 +558,15 @@ class GateNavigator(Node):
         elif new_state == DESCEND:
             self.depth_settle_alt = None
             self.depth_settle_stamp = self.state_entered
+        elif new_state == APPROACH:
+            self.clear_ticks = 1000     # assume clear until an obstacle says otherwise
         elif new_state == ALIGN:
             # Start a fresh probe. The infinite baseline stops the first window
             # from flipping direction before we have measured anything.
             self.probe_stamp = self.state_entered
             self.probe_error = float('inf')
             self.probe_samples = []
+            self.probe_cooldown = 0
             self.centred_ticks = 0
 
     # How long we have been in the current state, in seconds.
@@ -485,6 +576,12 @@ class GateNavigator(Node):
     # ------------------------------------ Control Loop ------------------------------------ #
     def control_loop(self):
         vel_cmd = Twist()
+
+        # Reset each tick; avoid_flare sets these when a state actually calls it.
+        self.avoid_ran = False
+        self.avoid_active = False
+        # The state this tick actually ran in; self.state may change before we log.
+        tick_state = self.state
 
         if self.state == DONE:
             self.publisher_.publish(vel_cmd)   # keep streaming zeros
@@ -552,9 +649,29 @@ class GateNavigator(Node):
 
                 # Centre the gate and drive forward, strafing around the flare if needed.
                 # Centring runs every tick, otherwise the gate drifts out of frame.
-                self.avoid_flare(vel_cmd)
+                blocked = self.avoid_flare(vel_cmd)
                 self.keep_gate_in_center(vel_cmd, gate)
-                vel_cmd.linear.x = self.param('forward_speed')
+
+                # Count how long the path has stayed clear. One clear frame is usually
+                # just box jitter, so full speed only comes back after a few in a row.
+                if blocked:
+                    self.clear_ticks = 0
+                else:
+                    self.clear_ticks = self.clear_ticks + 1
+
+                # Ease off the throttle while sidestepping instead of stopping dead.
+                # The strafe is faster than what is left of the forward speed, so we
+                # move sideways out of the obstacle's line quicker than we close on it,
+                # and we never stop and restart the way a hard cut would.
+                if self.clear_ticks >= self.param('clear_hold_ticks'):
+                    vel_cmd.linear.x = self.param('forward_speed')
+                else:
+                    vel_cmd.linear.x = (self.param('forward_speed')
+                                        * self.param('avoid_slow_factor'))
+                    self.get_logger().info(
+                        'Obstacle in the way, easing off (clear for %d/%d ticks)'
+                        % (self.clear_ticks, self.param('clear_hold_ticks')),
+                        throttle_duration_sec=1.0)
 
                 self.get_logger().info(
                     'Approach: x_off=%.2f y_off=%.2f w=%.2f h=%.2f w/h=%.2f conf=%.2f'
@@ -580,15 +697,23 @@ class GateNavigator(Node):
                 # Square to the gate, but the orbiting has almost certainly left us
                 # off to one side. Stop strafing and centre the gate before we commit,
                 # otherwise the blind run goes in at an offset and clips the frame.
+                # Avoidance runs here too. This branch is the one we always take,
+                # and skipping it meant nothing looked for obstacles at the exact
+                # moment we were deciding to commit.
+                blocked = self.avoid_flare(vel_cmd)
                 centred = self.keep_gate_in_center(vel_cmd, gate)
-                if centred:
+
+                # An obstacle in the path resets the hold, so we never start the
+                # blind run with something still in front of us.
+                if centred and not blocked:
                     self.centred_ticks = self.centred_ticks + 1
                 else:
                     self.centred_ticks = 0
 
                 self.get_logger().info(
-                    'Squared, centring: w/h=%.2f x_off=%.2f y_off=%.2f held=%d'
-                    % (gate.w_h_ratio, gate.x_offset, gate.y_offset, self.centred_ticks),
+                    'Squared, centring: w/h=%.2f x_off=%.2f y_off=%.2f held=%d blocked=%s'
+                    % (gate.w_h_ratio, gate.x_offset, gate.y_offset,
+                       self.centred_ticks, blocked),
                     throttle_duration_sec=1.0)
 
                 # Hold it there for a moment so we do not commit on one lucky frame
@@ -615,10 +740,15 @@ class GateNavigator(Node):
             # last stretch is open loop: hold depth and drive straight.
             self.hold_depth(vel_cmd)
             vel_cmd.linear.x = self.param('forward_speed')
+            # Open loop on the gate, but not blind to obstacles: clipping a flare
+            # mid-run is worse than going through the gate a little off-centre.
+            self.avoid_flare(vel_cmd)
             if self.time_in_state() >= self.param('through_duration'):
                 self.get_logger().info('Gate traversal complete')
                 self.transition(DONE)
 
+        # Report what the avoidance saw and did on this tick, in every state
+        self.avoidance_watch(vel_cmd, tick_state)
         self.publisher_.publish(vel_cmd)
             
 # ------------------------------------ Main Function ------------------------------------ #
