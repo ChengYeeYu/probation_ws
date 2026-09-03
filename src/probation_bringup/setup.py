@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'solution_template = probation_bringup.solution_template:main',
+            'solution = probation_bringup.solution:main',
             'minimal_publisher = probation_bringup.minimal_publisher:main',
             'minimal_subscriber = probation_bringup.minimal_subscriber:main',
             'service_member_function = probation_bringup.service_member_function:main',
