@@ -1,4 +1,21 @@
-#!/usr/bin/env python3
+# Yu Cheng Yee, Y2 ROBO
+
+# Assumptions:
+# 1. The gate is a square rectangle, and the camera is roughly aligned with the gate plane.
+# 2. There is only one flare in front of the gate.
+# 3. The starting position of the vehicle is not directly above the flare and the gate.
+# 4. Visibility underwater is good enough to see the gate and flare from a distance.
+# 5. The vehicle is robust enough to do sudden maneuvers to avoid the flare without losing control.
+# 6. The only type of obstacle is the flare.
+
+# Future Improvements:
+# 1. Add a more sophisticated obstacle avoidance algorithm that can handle multiple obstacles and different types of obstacles.
+# 2. Implement a mapping system to remember the locations of obstacles and gates for future runs.
+# 3. Improves the alignment algorithm to handle cases where the gate is partially occluded or not fully visible.
+
+# AI Disclamer
+# AI has been used to assist in the development of this code, including suggesting ideation, generating initial code structure, suggesting improvements, and providing explanations. 
+
 # ---------- Imports ----------
 from dataclasses import dataclass
 
@@ -638,8 +655,8 @@ class GateNavigator(Node):
                 self.transition(SEARCH)
             else:
                 # Would committing blind still be safe if we lost the gate next tick?
-                near = (gate.w >= self.param('commit_width') * 0.8
-                        or gate.h >= self.param('commit_height') * 0.8)
+                near = (gate.w >= self.param('commit_width')
+                        or gate.h >= self.param('commit_height'))
                 self.was_close = near and self.can_pass_through(gate)
 
                 # Centring runs every tick, otherwise the gate drifts out of frame.
