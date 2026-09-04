@@ -124,9 +124,9 @@ class GateNavigator(Node):
             ('target_depth', -1.6),          # metres, matches /mavros/global_position/rel_alt
             ('depth_tolerance', 0.1),
             ('depth_settle_band', 0.02),     # depth moving less than this counts as settled
-            ('depth_settle_time', 1.0),      # ...for this long, and the descent is finished
+            ('depth_settle_time', 0.5),      # ...for this long, and the descent is finished
             ('alt_gain', 0.5),
-            ('max_vertical_speed', 0.5),
+            ('max_vertical_speed', 0.8),
             
             # --- visual servoing ---
             ('yaw_gain', 1.5),
@@ -135,35 +135,39 @@ class GateNavigator(Node):
             ('center_tolerance', 0.1),       # |offset| below this counts as centred
 
             # --- forward motion ---
-            ('forward_speed', 0.5),
-            ('search_yaw_rate', 0.3),
+            ('forward_speed', 0.6),
+            ('search_yaw_rate', 0.5),
             ('commit_width', 0.5),           # gate box size at which we stop approaching
             ('commit_height', 0.5),          # height still grows when the gate looks narrow
-            ('through_duration', 6.0),       # seconds of blind forward travel through the gate
+            ('through_duration', 2.0),       # seconds of blind forward travel through the gate
 
             # --- aligning with the gate ---
             # Acceptance window for the gate box w/h. Outside it we are looking at
             # the gate from too steep an angle to fit through the opening.
-            ('gate_ratio_min', 0.75),        # head-on measured at ~0.85 in flight
+            ('gate_ratio_min', 0.6),        # head-on measured at ~0.85 in flight
             ('gate_ratio_max', 1.0),
-            ('align_strafe_speed', 0.25),
+            ('align_strafe_speed', 0.5),
             ('probe_duration', 2.0),         # seconds of strafing before judging a direction
             ('probe_min_improvement', 0.01), # ratio error must drop by this much to keep going
-            ('commit_hold_ticks', 5),        # ticks squared AND centred before committing
+            ('commit_hold_ticks', 1),        # ticks squared AND centred before committing
 
             # --- obstacle avoidance ---
-            ('flare_avoid_width', 0.05),     # flare box wider than this counts as close
-            ('flare_clearance', 0.1),       # near edge closer than this to our heading
-                                            #    counts as in the way
-            ('strafe_speed', 0.7),          # boosted: clear the obstacle faster than we close on it
-            ('avoid_slow_factor', 0.3),     # forward speed is scaled by this while dodging
-            ('clear_hold_ticks', 5),        # ticks the path must stay clear before full speed
+            ('flare_avoid_width', 0.008),     # flare box wider than this counts as close
+            ('flare_clearance', 0.15),      # berth we want even from a barely-close flare
+            ('flare_clearance_gain', 2.0),  # ...plus this much per unit of box width, since
+                                            #    a wider box means a closer flare
+            ('strafe_speed', 1.0),          # boosted: clear the obstacle faster than we close on it
+            ('avoid_slow_factor', 0.5),     # forward speed is scaled by this the moment
+                                            #    avoidance triggers, fading to nothing as...
+            ('flare_stop_width', 0.03),     # ...the box reaches this, where we stop closing
+                                            #    entirely and only the strafe runs
+            ('clear_hold_ticks', 1),        # ticks the path must stay clear before full speed
 
             # --- timeouts ---
-            ('descend_timeout', 60.0),   # backstop only; descent_has_settled is the normal exit
-            ('search_timeout', 60.0),
-            ('approach_timeout', 45.0),
-            ('align_timeout', 25.0),
+            ('descend_timeout', 10.0),   # backstop only; descent_has_settled is the normal exit
+            ('search_timeout', 30.0),
+            ('approach_timeout', 30.0),
+            ('align_timeout', 10.0),
             ('control_rate', 10.0),
         ])
 
@@ -453,6 +457,39 @@ class GateNavigator(Node):
                 % (older, newer, improvement),
                 throttle_duration_sec=1.0)
     
+    # Clear water between our heading and the object's near edge, in normalised
+    # image widths. Negative means our heading falls inside the box.
+    @staticmethod
+    def edge_gap(detected_object):
+        return abs(detected_object.x_offset) - detected_object.w / 2.0
+
+    # How much of that clear water we insist on. Box width stands in for distance,
+    # so a flare that looms wider is closer and gets a wider berth: there is less
+    # time to react, and its apparent size grows fastest just as we reach it.
+    def required_clearance(self, detected_object):
+        return (self.param('flare_clearance')
+                + self.param('flare_clearance_gain') * detected_object.w)
+
+    # How much of the forward speed survives while an obstacle is near. Box width
+    # stands in for distance again, so this fades from avoid_slow_factor at the moment
+    # avoidance triggers down to a dead stop at flare_stop_width: past that the flare
+    # is close enough that closing on it at all is the thing that gets us hit, and
+    # only the strafe should be running.
+    def avoid_speed_factor(self):
+        flare = self.get_detected_object('red_flare')
+        if flare is None:
+            return self.param('avoid_slow_factor')
+
+        near = self.param('flare_avoid_width')
+        stop = self.param('flare_stop_width')
+        if flare.w >= stop:
+            return 0.0
+        # Guard the degenerate window as well as the far end, so a stop width set
+        # at or below the trigger width does not divide by zero.
+        if flare.w <= near or stop <= near:
+            return self.param('avoid_slow_factor')
+        return self.param('avoid_slow_factor') * (stop - flare.w) / (stop - near)
+
     # Strafe sideways to get around the red flare when it is close and roughly ahead of us.
     # Returns True if an avoidance manoeuvre was applied.
     # Note this only touches linear.y, so yaw is still free to keep the gate centred.
@@ -473,10 +510,10 @@ class GateNavigator(Node):
             return False            # still far away
         # What matters is how close the obstacle's near edge comes to our heading,
         # not where its centre is. A narrow flare only needs nudging a little off
-        # centre to be clear; a wide one needs more room. Using the edge gap gets
-        # both from one threshold instead of a fixed offset that suits neither.
-        edge_gap = abs(flare.x_offset) - flare.w / 2.0
-        if edge_gap > self.param('flare_clearance'):
+        # centre to be clear; a wide one needs more room. Both the gap we have and
+        # the gap we want scale with the box, so one pair of parameters covers a
+        # flare seen far off and the same flare looming right in front of us.
+        if self.edge_gap(flare) > self.required_clearance(flare):
             return False            # far enough to the side, not in the way
 
         # Flare on the right (x_offset > 0) => strafe left => positive linear.y
@@ -521,13 +558,14 @@ class GateNavigator(Node):
                 close = 'YES'
             else:
                 close = 'no'
-            edge_gap = abs(raw.x_offset) - raw.w / 2.0
-            if edge_gap <= self.param('flare_clearance'):
+            edge_gap = self.edge_gap(raw)
+            clearance = self.required_clearance(raw)
+            if edge_gap <= clearance:
                 in_path = 'YES'
             else:
                 in_path = 'no'
-            seen = ('flare: w=%.2f h=%.2f x_off=%+.2f gap=%+.2f conf=%.2f(%s) age=%.1fs(%s) close=%s in_path=%s'
-                    % (raw.w, raw.h, raw.x_offset, edge_gap, raw.conf, conf_ok,
+            seen = ('flare: w=%.2f h=%.2f x_off=%+.2f gap=%+.2f/need=%.2f conf=%.2f(%s) age=%.1fs(%s) close=%s in_path=%s'
+                    % (raw.w, raw.h, raw.x_offset, edge_gap, clearance, raw.conf, conf_ok,
                        age, fresh, close, in_path))
 
         if not self.avoid_ran:
@@ -659,18 +697,18 @@ class GateNavigator(Node):
                 else:
                     self.clear_ticks = self.clear_ticks + 1
 
-                # Ease off the throttle while sidestepping instead of stopping dead.
-                # The strafe is faster than what is left of the forward speed, so we
-                # move sideways out of the obstacle's line quicker than we close on it,
-                # and we never stop and restart the way a hard cut would.
+                # Ease off the throttle while sidestepping rather than cutting it
+                # dead the moment anything shows up. How far off depends on how near
+                # the flare is: a distant one only costs us some speed, one right in
+                # front stops us outright so the strafe is the only thing moving.
                 if self.clear_ticks >= self.param('clear_hold_ticks'):
                     vel_cmd.linear.x = self.param('forward_speed')
                 else:
-                    vel_cmd.linear.x = (self.param('forward_speed')
-                                        * self.param('avoid_slow_factor'))
+                    factor = self.avoid_speed_factor()
+                    vel_cmd.linear.x = self.param('forward_speed') * factor
                     self.get_logger().info(
-                        'Obstacle in the way, easing off (clear for %d/%d ticks)'
-                        % (self.clear_ticks, self.param('clear_hold_ticks')),
+                        'Obstacle in the way, easing off to %.0f%% (clear for %d/%d ticks)'
+                        % (factor * 100.0, self.clear_ticks, self.param('clear_hold_ticks')),
                         throttle_duration_sec=1.0)
 
                 self.get_logger().info(
