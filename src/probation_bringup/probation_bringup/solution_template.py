@@ -144,24 +144,23 @@ class GateNavigator(Node):
             # --- aligning with the gate ---
             # Acceptance window for the gate box w/h. Outside it we are looking at
             # the gate from too steep an angle to fit through the opening.
-            ('gate_ratio_min', 0.6),        # head-on measured at ~0.85 in flight
+            ('gate_ratio_min', 0.75),        # head-on measured at ~0.85 in flight
             ('gate_ratio_max', 1.0),
-            ('align_strafe_speed', 0.5),
+            ('align_strafe_speed', 0.25),
             ('probe_duration', 2.0),         # seconds of strafing before judging a direction
             ('probe_min_improvement', 0.01), # ratio error must drop by this much to keep going
-            ('commit_hold_ticks', 1),        # ticks squared AND centred before committing
+            ('commit_hold_ticks', 5),        # ticks squared AND centred before committing
 
             # --- obstacle avoidance ---
-            ('flare_avoid_width', 0.008),     # flare box wider than this counts as close
-            ('flare_clearance', 0.15),      # berth we want even from a barely-close flare
-            ('flare_clearance_gain', 2.0),  # ...plus this much per unit of box width, since
-                                            #    a wider box means a closer flare
-            ('strafe_speed', 1.0),          # boosted: clear the obstacle faster than we close on it
-            ('avoid_slow_factor', 0.5),     # forward speed is scaled by this while dodging
-            ('clear_hold_ticks', 1     ),        # ticks the path must stay clear before full speed
+            ('flare_avoid_width', 0.05),     # flare box wider than this counts as close
+            ('flare_clearance', 0.1),       # near edge closer than this to our heading
+                                            #    counts as in the way
+            ('strafe_speed', 0.7),          # boosted: clear the obstacle faster than we close on it
+            ('avoid_slow_factor', 0.3),     # forward speed is scaled by this while dodging
+            ('clear_hold_ticks', 5),        # ticks the path must stay clear before full speed
 
             # --- timeouts ---
-            ('descend_timeout', 60.0),   # backstop only; the settle check in hold_depth is the normal exit
+            ('descend_timeout', 60.0),   # backstop only; descent_has_settled is the normal exit
             ('search_timeout', 60.0),
             ('approach_timeout', 45.0),
             ('align_timeout', 25.0),
@@ -289,6 +288,7 @@ class GateNavigator(Node):
         return detected_object    
 
     # ------------------------------------ Vehicle Control ------------------------------------ #
+    # TODO: Clean this up
     # Ensure the vehicle is in GUIDED mode and armed. Returns True if both conditions are met, False otherwise.
     def ensure_guided_and_armed(self):
         if self.vehicle_state is None:
@@ -323,9 +323,6 @@ class GateNavigator(Node):
     # Hold a target depth with a proportional controller. Returns True once the
     # descent is finished, which means either we are inside depth_tolerance, or the
     # depth has stopped changing and this is as deep as a P controller will get us.
-    # Being a plain P controller, it settles wherever thrust balances buoyancy, and
-    # that resting point can sit outside depth_tolerance forever, so the settle
-    # check below is the exit that normally fires.
     def hold_depth(self, vel_cmd):
         if self.rel_alt is None:
             return False
@@ -337,16 +334,24 @@ class GateNavigator(Node):
         # Reached the target, nothing left to wait for
         if abs(error) < self.param('depth_tolerance'):
             return True
+        return self.descent_has_settled()
+    
+    # True once the depth has stopped changing, meaning we are as deep as this
+    # controller is going to get us. hold_depth is a plain P controller, so it
+    # settles wherever thrust balances buoyancy, and that resting point can sit
+    # outside depth_tolerance forever.
+    def descent_has_settled(self):
+        if self.rel_alt is None:
+            return False
 
-        # Still making real progress, so restart the settle window
         now = self.get_clock().now()
+        # Still making real progress, so restart the window
         if (self.depth_settle_alt is None
                 or abs(self.rel_alt - self.depth_settle_alt) > self.param('depth_settle_band')):
             self.depth_settle_alt = self.rel_alt
             self.depth_settle_stamp = now
             return False
 
-        # Depth has stopped moving, so this is as deep as we are going to get
         return (now - self.depth_settle_stamp).nanoseconds * 1e-9 > self.param('depth_settle_time')
     
     # Yaw and rise/dive to bring the gate towards the centre of the image.
@@ -448,19 +453,6 @@ class GateNavigator(Node):
                 % (older, newer, improvement),
                 throttle_duration_sec=1.0)
     
-    # Clear water between our heading and the object's near edge, in normalised
-    # image widths. Negative means our heading falls inside the box.
-    @staticmethod
-    def edge_gap(detected_object):
-        return abs(detected_object.x_offset) - detected_object.w / 2.0
-
-    # How much of that clear water we insist on. Box width stands in for distance,
-    # so a flare that looms wider is closer and gets a wider berth: there is less
-    # time to react, and its apparent size grows fastest just as we reach it.
-    def required_clearance(self, detected_object):
-        return (self.param('flare_clearance')
-                + self.param('flare_clearance_gain') * detected_object.w)
-
     # Strafe sideways to get around the red flare when it is close and roughly ahead of us.
     # Returns True if an avoidance manoeuvre was applied.
     # Note this only touches linear.y, so yaw is still free to keep the gate centred.
@@ -481,10 +473,10 @@ class GateNavigator(Node):
             return False            # still far away
         # What matters is how close the obstacle's near edge comes to our heading,
         # not where its centre is. A narrow flare only needs nudging a little off
-        # centre to be clear; a wide one needs more room. Both the gap we have and
-        # the gap we want scale with the box, so one pair of parameters covers a
-        # flare seen far off and the same flare looming right in front of us.
-        if self.edge_gap(flare) > self.required_clearance(flare):
+        # centre to be clear; a wide one needs more room. Using the edge gap gets
+        # both from one threshold instead of a fixed offset that suits neither.
+        edge_gap = abs(flare.x_offset) - flare.w / 2.0
+        if edge_gap > self.param('flare_clearance'):
             return False            # far enough to the side, not in the way
 
         # Flare on the right (x_offset > 0) => strafe left => positive linear.y
@@ -529,14 +521,13 @@ class GateNavigator(Node):
                 close = 'YES'
             else:
                 close = 'no'
-            edge_gap = self.edge_gap(raw)
-            clearance = self.required_clearance(raw)
-            if edge_gap <= clearance:
+            edge_gap = abs(raw.x_offset) - raw.w / 2.0
+            if edge_gap <= self.param('flare_clearance'):
                 in_path = 'YES'
             else:
                 in_path = 'no'
-            seen = ('flare: w=%.2f h=%.2f x_off=%+.2f gap=%+.2f/need=%.2f conf=%.2f(%s) age=%.1fs(%s) close=%s in_path=%s'
-                    % (raw.w, raw.h, raw.x_offset, edge_gap, clearance, raw.conf, conf_ok,
+            seen = ('flare: w=%.2f h=%.2f x_off=%+.2f gap=%+.2f conf=%.2f(%s) age=%.1fs(%s) close=%s in_path=%s'
+                    % (raw.w, raw.h, raw.x_offset, edge_gap, raw.conf, conf_ok,
                        age, fresh, close, in_path))
 
         if not self.avoid_ran:
